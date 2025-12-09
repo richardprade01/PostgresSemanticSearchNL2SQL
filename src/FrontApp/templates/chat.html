@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>Azure AI Agent Chat</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v={{ range(1, 10000) | random }}">
+</head>
+<body>
+    <div class="container">
+        <div class="chat-header">
+            <div class="header-content">
+                <h1>🤖 Azure AI Agent Chat</h1>
+                <p class="subtitle">Powered by PostgreSQL MCP Server</p>
+            </div>
+            <div class="header-actions">
+                <button id="new-session-btn" class="btn btn-secondary">New Session</button>
+                <button id="clear-chat-btn" class="btn btn-secondary">Clear Chat</button>
+            </div>
+        </div>
+
+        <div class="chat-container">
+            <div id="chat-messages" class="chat-messages"></div>
+
+            <div class="chat-input-container">
+                <div class="input-wrapper">
+                    <textarea 
+                        id="user-input" 
+                        placeholder="Type your message here... (Press Enter to send, Shift+Enter for new line)"
+                        rows="1"
+                    ></textarea>
+                    <button id="send-btn" class="btn btn-primary">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/>
+                        </svg>
+                        Send
+                    </button>
+                </div>
+                <div id="status-indicator" class="status-indicator"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal for Tool Details -->
+    <div id="tool-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="modal-title">Tool Execution Details</h2>
+                <span class="modal-close">&times;</span>
+            </div>
+            <div class="modal-body">
+                <div class="detail-section">
+                    <h3>📥 Request</h3>
+                    <div class="detail-label">Tool Name:</div>
+                    <div id="modal-tool-name" class="detail-value"></div>
+                    <div class="detail-label">Arguments:</div>
+                    <pre id="modal-arguments" class="detail-code"></pre>
+                </div>
+                <div class="detail-section">
+                    <h3>📤 Response</h3>
+                    <pre id="modal-output" class="detail-code"></pre>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let sessionId = 'default';
+        let isProcessing = false;
+        let currentToolDetails = [];
+
+        const chatMessages = document.getElementById('chat-messages');
+        const userInput = document.getElementById('user-input');
+        const sendBtn = document.getElementById('send-btn');
+        const newSessionBtn = document.getElementById('new-session-btn');
+        const clearChatBtn = document.getElementById('clear-chat-btn');
+        const statusIndicator = document.getElementById('status-indicator');
+
+        // Auto-resize textarea
+        userInput.addEventListener('input', function() {
+            this.style.height = 'auto';
+            this.style.height = Math.min(this.scrollHeight, 150) + 'px';
+        });
+
+        // Handle Enter key
+        userInput.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+
+        // Send button click
+        sendBtn.addEventListener('click', sendMessage);
+
+        // New session button
+        newSessionBtn.addEventListener('click', async function() {
+            if (confirm('Start a new session? This will clear the current conversation.')) {
+                try {
+                    const response = await fetch('/api/new-session', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'}
+                    });
+                    const data = await response.json();
+                    sessionId = data.session_id;
+                    clearChatUI();
+                    addMessage('assistant', 'New session started! How can I help you?');
+                } catch (error) {
+                    console.error('Error creating new session:', error);
+                    showStatus('Error creating new session', 'error');
+                }
+            }
+        });
+
+        // Clear chat button
+        clearChatBtn.addEventListener('click', async function() {
+            if (confirm('Clear the current conversation?')) {
+                try {
+                    await fetch('/api/clear-session', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({session_id: sessionId})
+                    });
+                    clearChatUI();
+                    addMessage('assistant', 'Chat cleared. How can I help you?');
+                } catch (error) {
+                    console.error('Error clearing session:', error);
+                    showStatus('Error clearing chat', 'error');
+                }
+            }
+        });
+
+        function clearChatUI() {
+            chatMessages.innerHTML = '';
+        }
+
+        function showStatus(message, type = 'info') {
+            statusIndicator.textContent = message;
+            statusIndicator.className = `status-indicator ${type}`;
+            statusIndicator.style.display = 'block';
+            
+            setTimeout(() => {
+                statusIndicator.style.display = 'none';
+            }, 3000);
+        }
+
+        function formatMessageText(text) {
+            if (!text) return '';
+            
+            // Escape HTML to prevent XSS
+            let formatted = text
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+            
+            // Detect and format tables (lines with | characters)
+            const lines = formatted.split('\n');
+            let inTable = false;
+            let tableLines = [];
+            let result = [];
+            
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                
+                // Check if line looks like a table row (contains |)
+                if (line.includes('|') && line.trim().length > 0) {
+                    if (!inTable) {
+                        inTable = true;
+                        tableLines = [];
+                    }
+                    tableLines.push(line);
+                } else {
+                    // End of table or non-table line
+                    if (inTable && tableLines.length > 0) {
+                        result.push(formatTable(tableLines));
+                        tableLines = [];
+                        inTable = false;
+                    }
+                    result.push(line);
+                }
+            }
+            
+            // Handle remaining table if any
+            if (inTable && tableLines.length > 0) {
+                result.push(formatTable(tableLines));
+            }
+            
+            formatted = result.join('\n');
+            
+            // Convert **bold** to <strong>
+            formatted = formatted.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+            
+            // Convert ### Headers to <h3>
+            formatted = formatted.replace(/^###\s+(.+)$/gm, '<h3>$1</h3>');
+            
+            // Convert bullet points (- or *) to list items (but not table separators)
+            formatted = formatted.replace(/^[\s]*[-*]\s+(.+)$/gm, function(match, content) {
+                // Don't convert if it's a table separator line
+                if (match.includes('---')) return match;
+                return '<li>' + content + '</li>';
+            });
+            
+            // Wrap consecutive list items in <ul>
+            formatted = formatted.replace(/(<li>.*<\/li>\n?)+/g, '<ul>$&</ul>');
+            
+            // Convert line breaks to <br> tags
+            formatted = formatted.replace(/\n/g, '<br>');
+            
+            // Handle numbered lists
+            formatted = formatted.replace(/^(\d+)\.\s+(.+)$/gm, '<div class="numbered-item"><span class="number">$1.</span> $2</div>');
+            
+            return formatted;
+        }
+        
+        function formatTable(lines) {
+            // Build HTML table from lines with | separators
+            let tableHtml = '<table class="message-table">';
+            
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i].trim();
+                
+                // Skip separator lines (lines with mostly dashes)
+                if (line.replace(/[|\-\s]/g, '').length === 0) {
+                    continue;
+                }
+                
+                // Split by | and filter empty cells at start/end
+                const cells = line.split('|').map(c => c.trim()).filter(c => c.length > 0);
+                
+                if (cells.length === 0) continue;
+                
+                // First non-separator line is header
+                const tag = (i === 0 || (i === 1 && lines[0].includes('---'))) ? 'th' : 'td';
+                const row = cells.map(cell => `<${tag}>${cell}</${tag}>`).join('');
+                
+                if (tag === 'th') {
+                    tableHtml += `<thead><tr>${row}</tr></thead>`;
+                } else {
+                    if (!tableHtml.includes('<tbody>')) {
+                        tableHtml += '<tbody>';
+                    }
+                    tableHtml += `<tr>${row}</tr>`;
+                }
+            }
+            
+            if (tableHtml.includes('<tbody>')) {
+                tableHtml += '</tbody>';
+            }
+            tableHtml += '</table>';
+            
+            return tableHtml;
+        }
+
+    function addMessage(role, text, images = [], tools = [], toolDetails = [], files = []) {
+            console.log('=== addMessage called ===');
+            console.log('Tools count:', tools?.length || 0, tools);
+            console.log('ToolDetails count:', toolDetails?.length || 0, toolDetails);
+            console.log('Files count:', files?.length || 0, files);
+            
+            // Verify alignment
+            if (tools && toolDetails) {
+                for (let i = 0; i < Math.max(tools.length, toolDetails.length); i++) {
+                    console.log(`[${i}] Tool: "${tools[i]}" -> Detail: "${toolDetails[i]?.name}"`);
+                }
+            }
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${role}`;
+            
+            const avatar = document.createElement('div');
+            avatar.className = 'message-avatar';
+            avatar.textContent = role === 'user' ? '👤' : '🤖';
+            
+            const contentDiv = document.createElement('div');
+            contentDiv.className = 'message-content';
+            
+            const textDiv = document.createElement('div');
+            textDiv.className = 'message-text';
+            
+            // Format text with proper line breaks and markdown-style formatting
+            const formattedText = formatMessageText(text);
+            textDiv.innerHTML = formattedText;
+            
+            contentDiv.appendChild(textDiv);
+            
+            // Add images if any
+            if (images && images.length > 0) {
+                console.log('Adding images to message:', images);
+                const imagesContainer = document.createElement('div');
+                imagesContainer.className = 'message-images';
+                
+                images.forEach((img, idx) => {
+                    console.log(`Processing image ${idx}:`, img);
+                    const imgWrapper = document.createElement('div');
+                    imgWrapper.className = 'image-wrapper';
+                    
+                    const imgElement = document.createElement('img');
+                    imgElement.src = img.data;
+                    imgElement.alt = 'Generated visualization';
+                    imgElement.className = 'generated-image';
+                    imgElement.onerror = function() {
+                        console.error('Failed to load image:', img);
+                    };
+                    imgElement.onload = function() {
+                        console.log('Image loaded successfully:', img.file_id);
+                    };
+                    
+                    imgWrapper.appendChild(imgElement);
+                    imagesContainer.appendChild(imgWrapper);
+                });
+                
+                contentDiv.appendChild(imagesContainer);
+            }
+            
+            // Add file download links if any
+            if (files && files.length > 0) {
+                const filesContainer = document.createElement('div');
+                filesContainer.className = 'message-files';
+                
+                const filesLabel = document.createElement('div');
+                filesLabel.className = 'files-label';
+                filesLabel.innerHTML = '📎 <strong>Generated Files:</strong>';
+                filesContainer.appendChild(filesLabel);
+                
+                files.forEach((file, idx) => {
+                    const fileLink = document.createElement('a');
+                    fileLink.href = file.download_url;
+                    fileLink.className = 'file-download-link';
+                    fileLink.download = true;
+                    
+                    // Use file_name if available, otherwise use a generic label
+                    const label = file.file_name || `Generated File ${idx + 1}`;
+                    
+                    // Add file type icon based on file extension
+                    let icon = '📄';
+                    if (file.file_type) {
+                        const type = file.file_type.toLowerCase();
+                        if (type === 'csv') icon = '📊';
+                        else if (['xlsx', 'xls'].includes(type)) icon = '📈';
+                        else if (['pdf'].includes(type)) icon = '📕';
+                        else if (['png', 'jpg', 'jpeg', 'gif'].includes(type)) icon = '🖼️';
+                        else if (['docx', 'doc'].includes(type)) icon = '📝';
+                        else if (['pptx', 'ppt'].includes(type)) icon = '📊';
+                        else if (['zip'].includes(type)) icon = '📦';
+                    }
+                    
+                    fileLink.textContent = `${icon} ${label}`;
+                    fileLink.target = '_blank';
+                    filesContainer.appendChild(fileLink);
+                });
+                
+                contentDiv.appendChild(filesContainer);
+            }
+            
+            // Add logs if any (collapsed by default)
+            if (tools && tools.length > 0) {
+                const toolsContainer = document.createElement('div');
+                toolsContainer.className = 'message-tools';
+                
+                const icon = document.createElement('span');
+                icon.className = 'tool-icon';
+                icon.textContent = '�';
+                
+                const label = document.createElement('span');
+                label.className = 'tool-label';
+                label.textContent = 'MCP Tools:';
+                
+                const toolList = document.createElement('div');
+                toolList.className = 'tool-list';
+                
+                tools.forEach((tool, idx) => {
+                    console.log(`Creating pill for tool[${idx}]: "${tool}"`);
+                    const toolItem = document.createElement('span');
+                    toolItem.className = 'tool-item';
+                    toolItem.textContent = tool;
+                    
+                    // Make tool clickable if we have details for it
+                    if (toolDetails && toolDetails[idx]) {
+                        console.log(`  -> Attaching detail: "${toolDetails[idx].name}"`);
+                        toolItem.classList.add('clickable');
+                        toolItem.title = 'Click to view execution details';
+                        toolItem.onclick = () => showToolDetails(toolDetails[idx]);
+                    } else {
+                        console.warn(`  -> NO DETAIL at index ${idx}`);
+                    }
+                    
+                    toolList.appendChild(toolItem);
+                });
+                
+                toolsContainer.appendChild(icon);
+                toolsContainer.appendChild(label);
+                toolsContainer.appendChild(toolList);
+                contentDiv.appendChild(toolsContainer);
+            }
+            
+            const timestamp = document.createElement('div');
+            timestamp.className = 'message-timestamp';
+            timestamp.textContent = new Date().toLocaleTimeString();
+            contentDiv.appendChild(timestamp);
+            
+            messageDiv.appendChild(avatar);
+            messageDiv.appendChild(contentDiv);
+            
+            chatMessages.appendChild(messageDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
+        function addThinkingIndicator() {
+            const thinkingDiv = document.createElement('div');
+            thinkingDiv.className = 'message assistant thinking';
+            thinkingDiv.id = 'thinking-indicator';
+            
+            const avatar = document.createElement('div');
+            avatar.className = 'message-avatar';
+            avatar.textContent = '🤖';
+            
+            const contentDiv = document.createElement('div');
+            contentDiv.className = 'message-content';
+            
+            const dotsDiv = document.createElement('div');
+            dotsDiv.className = 'thinking-dots';
+            dotsDiv.innerHTML = '<span>.</span><span>.</span><span>.</span>';
+            
+            contentDiv.appendChild(dotsDiv);
+            thinkingDiv.appendChild(avatar);
+            thinkingDiv.appendChild(contentDiv);
+            
+            chatMessages.appendChild(thinkingDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
+        function removeThinkingIndicator() {
+            const thinking = document.getElementById('thinking-indicator');
+            if (thinking) {
+                thinking.remove();
+            }
+        }
+
+        function showToolDetails(toolDetail) {
+            console.log('showToolDetails called with:', toolDetail);
+            const modal = document.getElementById('tool-modal');
+            const toolName = document.getElementById('modal-tool-name');
+            const argumentsElem = document.getElementById('modal-arguments');
+            const output = document.getElementById('modal-output');
+            
+            if (!modal || !toolName || !argumentsElem || !output) {
+                console.error('Modal elements not found');
+                return;
+            }
+            
+            // Populate modal content
+            const fullToolName = toolDetail.server ? `${toolDetail.server}:${toolDetail.name}` : toolDetail.name;
+            toolName.textContent = fullToolName;
+            
+            // Format arguments as JSON
+            if (toolDetail.arguments_parsed) {
+                argumentsElem.textContent = JSON.stringify(toolDetail.arguments_parsed, null, 2);
+            } else {
+                argumentsElem.textContent = toolDetail.arguments || 'No arguments';
+            }
+            
+            // Format output
+            try {
+                const outputObj = typeof toolDetail.output === 'string' ? JSON.parse(toolDetail.output) : toolDetail.output;
+                output.textContent = JSON.stringify(outputObj, null, 2);
+            } catch {
+                output.textContent = toolDetail.output || 'No output available';
+            }
+            
+            modal.style.display = 'flex';
+            console.log('Modal displayed');
+        }
+
+        // Modal close handlers
+        const modal = document.getElementById('tool-modal');
+        const closeBtn = document.querySelector('.modal-close');
+        
+        closeBtn.onclick = function() {
+            modal.style.display = 'none';
+        };
+        
+        window.onclick = function(event) {
+            if (event.target == modal) {
+                modal.style.display = 'none';
+            }
+        };
+
+        async function sendMessage() {
+            if (isProcessing) return;
+            
+            const message = userInput.value.trim();
+            if (!message) return;
+            
+            // Add user message to UI
+            addMessage('user', message);
+            
+            // Clear input
+            userInput.value = '';
+            userInput.style.height = 'auto';
+            
+            // Disable input while processing
+            isProcessing = true;
+            userInput.disabled = true;
+            sendBtn.disabled = true;
+            
+            // Show thinking indicator
+            addThinkingIndicator();
+            showStatus('Processing your request...', 'info');
+            
+            try {
+                const response = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        message: message,
+                        session_id: sessionId
+                    })
+                });
+                
+                const data = await response.json();
+                
+                removeThinkingIndicator();
+                
+                if (response.ok) {
+                    console.log('Response data:', data);
+                    console.log('Images received:', data.images);
+                    console.log('Files received:', data.files);
+                    console.log('Tools received:', data.tools);
+                    console.log('Tool details received:', data.tool_details);
+                    addMessage('assistant', data.response, data.images, data.tools, data.tool_details, data.files);
+                    showStatus('Response received', 'success');
+                } else {
+                    addMessage('assistant', `Error: ${data.error || 'Unknown error occurred'}`);
+                    showStatus('Error processing request', 'error');
+                }
+            } catch (error) {
+                removeThinkingIndicator();
+                console.error('Error:', error);
+                addMessage('assistant', 'Sorry, an error occurred while processing your request. Please try again.');
+                showStatus('Connection error', 'error');
+            } finally {
+                isProcessing = false;
+                userInput.disabled = false;
+                sendBtn.disabled = false;
+                userInput.focus();
+            }
+        }
+
+        // Focus input on load
+        window.addEventListener('load', () => {
+            userInput.focus();
+        });
+    </script>
+</body>
+</html>
